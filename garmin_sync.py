@@ -477,7 +477,13 @@ def build_activities(con: sqlite3.Connection) -> list[dict]:
 
 RECORD_COLUMNS = ["type_id", "record", "value", "display", "day", "activity_id", "activity_name"]
 RECORD_NAMES = {1: "1 км", 2: "1 миля", 3: "5 км", 4: "10 км", 5: "Полумарафон", 6: "Марафон",
-                7: "Самая длинная пробежка"}
+                7: "Самая длинная пробежка", 8: "Самая длинная велопоездка", 9: "Максимальный набор высоты",
+                10: "Велосипед 20 км", 11: "Велосипед 40 км",
+                12: "Больше всего шагов за день", 13: "Больше всего шагов за неделю",
+                14: "Больше всего шагов за месяц", 15: "Самая длинная серия дней с целью по шагам",
+                16: "Текущая серия дней с целью по шагам"}
+RECORD_TIME_IDS = {1, 2, 3, 4, 5, 6, 10, 11}      # значение — секунды
+RECORD_DISTANCE_IDS = {7, 8}                       # значение — метры
 
 
 def _snapshot(con: sqlite3.Connection, key: str):
@@ -502,19 +508,23 @@ def build_records(con: sqlite3.Connection) -> list[dict]:
             continue
         tid = p.get("typeId")
         val = p["value"]
-        if tid in (1, 2, 3, 4, 5, 6):
+        if tid in RECORD_TIME_IDS:
             display = _hms(val)
-        elif tid == 7:
+        elif tid in RECORD_DISTANCE_IDS:
             display = f"{val / 1000:.2f} км".replace(".", ",")
+        elif tid == 9:
+            display = f"{round(val)} м"
+        elif tid in (15, 16):
+            display = f"{int(val)} дн."
         else:
-            display = str(int(val)) if isinstance(val, (int, float)) and float(val).is_integer() else str(val)
+            display = str(int(round(val))) if isinstance(val, (int, float)) else str(val)
         day = (p.get("prStartTimeLocalFormatted") or p.get("actStartDateTimeInGMTFormatted")
                or p.get("prStartTimeGmtFormatted") or "")[:10] or None
         rows.append({
             "type_id": tid,
             "record": RECORD_NAMES.get(tid) or type_keys.get(tid) or f"Рекорд {tid}",
             "value": val, "display": display, "day": day,
-            "activity_id": p.get("activityId"), "activity_name": p.get("activityName"),
+            "activity_id": p.get("activityId") or None, "activity_name": p.get("activityName"),
         })
     rows.sort(key=lambda r: (r["type_id"] is None, r["type_id"] or 0))
     return rows
