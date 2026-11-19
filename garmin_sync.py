@@ -70,6 +70,7 @@ DAILY_METRICS = {
 # Данные «на сейчас», а не за конкретный день: забираются один раз за запуск.
 # Порог лактата дополнительно пишется в raw_daily за сегодняшнюю дату — так копится история.
 SNAPSHOT_METRICS = {
+    "personal_information":      lambda c: c.get_personal_information(),
     "personal_records":          lambda c: c.get_personal_record(),
     "personal_record_types":     lambda c: c.get_personal_record_types(),
     "lactate_threshold":         lambda c: c.get_lactate_threshold(latest=True),
@@ -226,7 +227,7 @@ def sync_snapshots(client, con: sqlite3.Connection) -> None:
                         (dt.date.today().isoformat(), key, payload, now))
         time.sleep(REQUEST_DELAY)
     con.commit()
-    log.info("Рекорды и порог лактата обновлены")
+    log.info("Профиль, рекорды и порог лактата обновлены")
 
 
 # ---------------------------------------------------------------- summary
@@ -575,11 +576,40 @@ def build_lactate(con: sqlite3.Connection) -> list[dict]:
     return rows
 
 
+PROFILE_COLUMNS = ["age", "sex", "height_cm", "weight_kg", "updated"]
+
+
+def build_profile(con: sqlite3.Connection) -> list[dict]:
+    """Возраст и пол для сравнения с возрастными нормами. Дату рождения не сохраняем — только возраст."""
+    info = _snapshot(con, "personal_information")
+    if not isinstance(info, dict):
+        return []
+    birth = find_key(info, "birthDate")
+    age = None
+    if isinstance(birth, str) and len(birth) >= 10:
+        try:
+            b = dt.date.fromisoformat(birth[:10])
+            t = dt.date.today()
+            age = t.year - b.year - ((t.month, t.day) < (b.month, b.day))
+        except ValueError:
+            pass
+    sex = find_key(info, "genderType") or find_key(info, "gender")
+    sex = {"MALE": "male", "FEMALE": "female"}.get(str(sex).upper(), sex) if sex else None
+    height = find_key(info, "height")
+    weight = find_key(info, "weight")
+    if isinstance(weight, (int, float)) and weight > 1000:  # Garmin хранит вес в граммах
+        weight = weight / 1000
+    row = con.execute("SELECT fetched_at FROM snapshots WHERE key='personal_information'").fetchone()
+    return [{"age": age, "sex": sex, "height_cm": num1(height), "weight_kg": num1(weight),
+             "updated": row[0] if row else None}]
+
+
 # Дополнительные таблицы: имя файла/таблицы SQLite, лист в Google-таблице, столбцы, построитель
 EXTRA_TABLES = [
     ("activities", "Тренировки", ACTIVITY_COLUMNS, build_activities),
     ("records", "Рекорды", RECORD_COLUMNS, build_records),
     ("lactate_threshold", "Порог лактата", LT_COLUMNS, build_lactate),
+    ("profile", "Профиль", PROFILE_COLUMNS, build_profile),
 ]
 
 
