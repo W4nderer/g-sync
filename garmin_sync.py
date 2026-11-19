@@ -63,6 +63,7 @@ DAILY_METRICS = {
     "training_status":    lambda c, d: c.get_training_status(d),
     "max_metrics":        lambda c, d: c.get_max_metrics(d),
     "activities":         lambda c, d: c.get_activities_by_date(d, d),
+    "race_predictions":   lambda c, d: c.get_race_predictions(d, d, "daily"),
 }
 
 # Ошибки, при которых нет смысла продолжать (имена классов garminconnect)
@@ -226,6 +227,12 @@ def activities_stats(raw: dict):
     return len(acts), round(dist / 1000, 2), round(dur / 60, 1)
 
 
+def race_seconds(raw: dict, key: str):
+    """Прогноз Garmin в секундах: ответ бывает списком дней или одним объектом."""
+    val = first(raw, f"race_predictions:0.{key}", f"race_predictions:{key}")
+    return int(round(val)) if isinstance(val, (int, float)) and val > 0 else None
+
+
 SUMMARY_COLUMNS = [
     "day",
     "spo2_avg", "spo2_min", "spo2_sleep_avg",
@@ -236,6 +243,7 @@ SUMMARY_COLUMNS = [
     "steps", "kcal", "intensity_moderate_min", "intensity_vigorous_min",
     "readiness", "vo2max",
     "activities", "activities_km", "activities_min",
+    "race_5k_s", "race_10k_s", "race_hm_s", "race_marathon_s",
 ]
 
 
@@ -272,6 +280,11 @@ def summarize_day(day: str, raw: dict) -> dict:
         "activities": n_act,
         "activities_km": km,
         "activities_min": mins,
+        # Прогноз Garmin (Race Predictor), секунды
+        "race_5k_s": race_seconds(raw, "time5K"),
+        "race_10k_s": race_seconds(raw, "time10K"),
+        "race_hm_s": race_seconds(raw, "timeHalfMarathon"),
+        "race_marathon_s": race_seconds(raw, "timeMarathon"),
     }
 
 
