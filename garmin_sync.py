@@ -32,6 +32,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -66,6 +67,17 @@ DAILY_METRICS = {
     "race_predictions":   lambda c, d: c.get_race_predictions(d, d, "daily"),
 }
 
+# Данные «на сейчас», а не за конкретный день: забираются один раз за запуск.
+# Порог лактата дополнительно пишется в raw_daily за сегодняшнюю дату — так копится история.
+SNAPSHOT_METRICS = {
+    "personal_records":          lambda c: c.get_personal_record(),
+    "personal_record_types":     lambda c: c.get_personal_record_types(),
+    "lactate_threshold":         lambda c: c.get_lactate_threshold(latest=True),
+    "lactate_threshold_history": lambda c: c.get_lactate_threshold(
+        latest=False, start_date=(dt.date.today() - dt.timedelta(days=365)).isoformat(),
+        end_date=dt.date.today().isoformat()),
+}
+
 # Ошибки, при которых нет смысла продолжать (имена классов garminconnect)
 FATAL_ERRORS = ("Authentication", "TooManyRequests")
 
@@ -96,6 +108,12 @@ def open_db() -> sqlite3.Connection:
             payload    TEXT,
             fetched_at TEXT NOT NULL,
             PRIMARY KEY (day, metric)
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            key        TEXT PRIMARY KEY,
+            payload    TEXT,
+            fetched_at TEXT NOT NULL
         )""")
     return con
 
@@ -185,6 +203,32 @@ def sync(client, con: sqlite3.Connection, start: dt.date, end: dt.date, force: b
     log.info("Итого: загружено %d, пропущено (уже есть) %d, ошибок %d", fetched, skipped, failed)
 
 
+def sync_snapshots(client, con: sqlite3.Connection) -> None:
+    """Рекорды и порог лактата — один запрос на метрику за запуск."""
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    for key, fn in SNAPSHOT_METRICS.items():
+        try:
+            data = fn(client)
+        except AttributeError:
+            log.warning("Метод для '%s' отсутствует в этой версии garminconnect — пропускаю", key)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            if is_fatal(exc):
+                log.error("Остановка: %s: %s", type(exc).__name__, exc)
+                raise
+            log.warning("%s: %s: %s", key, type(exc).__name__, exc)
+            time.sleep(REQUEST_DELAY)
+            continue
+        payload = json.dumps(data, ensure_ascii=False)
+        con.execute("INSERT OR REPLACE INTO snapshots(key, payload, fetched_at) VALUES (?,?,?)", (key, payload, now))
+        if key == "lactate_threshold":
+            con.execute("INSERT OR REPLACE INTO raw_daily(day, metric, payload, fetched_at) VALUES (?,?,?,?)",
+                        (dt.date.today().isoformat(), key, payload, now))
+        time.sleep(REQUEST_DELAY)
+    con.commit()
+    log.info("Рекорды и порог лактата обновлены")
+
+
 # ---------------------------------------------------------------- summary
 
 def dig(obj, path: str):
@@ -227,6 +271,35 @@ def activities_stats(raw: dict):
     return len(acts), round(dist / 1000, 2), round(dur / 60, 1)
 
 
+def find_key(obj, key: str):
+    """Первое непустое значение ключа на любой глубине. Garmin кладёт статус тренированности
+    в словари с id устройства в качестве ключа, поэтому точный путь заранее неизвестен."""
+    if isinstance(obj, dict):
+        if obj.get(key) not in (None, ""):
+            return obj[key]
+        for v in obj.values():
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def status_code(phrase):
+    """PRODUCTIVE_6 -> PRODUCTIVE"""
+    if not isinstance(phrase, str):
+        return None
+    return re.sub(r"_\d+$", "", phrase)
+
+
+def num1(v):
+    return round(v, 1) if isinstance(v, (int, float)) else None
+
+
 def race_seconds(raw: dict, key: str):
     """Прогноз Garmin в секундах: ответ бывает списком дней или одним объектом."""
     val = first(raw, f"race_predictions:0.{key}", f"race_predictions:{key}")
@@ -244,11 +317,15 @@ SUMMARY_COLUMNS = [
     "readiness", "vo2max",
     "activities", "activities_km", "activities_min",
     "race_5k_s", "race_10k_s", "race_hm_s", "race_marathon_s",
+    "floors_up", "floors_down",
+    "training_status", "acute_load", "chronic_load", "acwr", "acwr_status",
+    "load_aerobic_low", "load_aerobic_high", "load_anaerobic", "load_balance",
 ]
 
 
 def summarize_day(day: str, raw: dict) -> dict:
     n_act, km, mins = activities_stats(raw)
+    ts = raw.get("training_status")
     return {
         "day": day,
         "spo2_avg": first(raw, "spo2:averageSpO2", "sleep:dailySleepDTO.averageSpO2Value"),
@@ -285,6 +362,19 @@ def summarize_day(day: str, raw: dict) -> dict:
         "race_10k_s": race_seconds(raw, "time10K"),
         "race_hm_s": race_seconds(raw, "timeHalfMarathon"),
         "race_marathon_s": race_seconds(raw, "timeMarathon"),
+        # Этажи (барометр часов)
+        "floors_up": num1(first(raw, "stats:floorsAscended")),
+        "floors_down": num1(first(raw, "stats:floorsDescended")),
+        # Статус тренированности и нагрузка
+        "training_status": status_code(find_key(ts, "trainingStatusFeedbackPhrase")),
+        "acute_load": num1(find_key(ts, "dailyTrainingLoadAcute")),
+        "chronic_load": num1(find_key(ts, "dailyTrainingLoadChronic")),
+        "acwr": num1(find_key(ts, "dailyAcuteChronicWorkloadRatio")),
+        "acwr_status": find_key(ts, "acwrStatus"),
+        "load_aerobic_low": num1(find_key(ts, "monthlyLoadAerobicLow")),
+        "load_aerobic_high": num1(find_key(ts, "monthlyLoadAerobicHigh")),
+        "load_anaerobic": num1(find_key(ts, "monthlyLoadAnaerobic")),
+        "load_balance": status_code(find_key(ts, "trainingBalanceFeedbackPhrase")),
     }
 
 
@@ -318,6 +408,212 @@ def build_summary(con: sqlite3.Connection) -> list[dict]:
         for r in rows:
             w.writerow([fmt(r[c]) for c in SUMMARY_COLUMNS])
     return rows
+
+
+# ---------------------------------------------------------------- extra tables
+
+def _hms(sec) -> str | None:
+    if not isinstance(sec, (int, float)) or sec <= 0:
+        return None
+    s = int(round(sec))
+    h, m, x = s // 3600, s % 3600 // 60, s % 60
+    return f"{h}:{m:02d}:{x:02d}" if h else f"{m}:{x:02d}"
+
+
+ACTIVITY_COLUMNS = [
+    "activity_id", "day", "start_local", "type", "name",
+    "distance_km", "duration_min", "moving_min", "pace_s_km", "pace",
+    "avg_hr", "max_hr", "avg_cadence", "avg_power", "elev_gain_m",
+    "aerobic_te", "anaerobic_te", "te_label", "training_load", "vo2max", "kcal",
+]
+
+
+def build_activities(con: sqlite3.Connection) -> list[dict]:
+    """Одна строка на тренировку — из уже загруженных списков тренировок по дням."""
+    rows, seen = [], set()
+    for day, payload in con.execute("SELECT day, payload FROM raw_daily WHERE metric='activities' ORDER BY day"):
+        try:
+            acts = json.loads(payload) if payload else []
+        except json.JSONDecodeError:
+            continue
+        for a in acts if isinstance(acts, list) else []:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("activityId")
+            if aid in seen:
+                continue
+            seen.add(aid)
+            typ = dig(a, "activityType.typeKey") or ""
+            dist = a.get("distance") or 0
+            speed = a.get("averageSpeed")
+            running = any(k in typ for k in ("running", "treadmill", "trail", "track"))
+            pace = 1000 / speed if running and isinstance(speed, (int, float)) and speed > 0 else None
+            rows.append({
+                "activity_id": aid,
+                "day": (a.get("startTimeLocal") or day)[:10],
+                "start_local": a.get("startTimeLocal"),
+                "type": typ,
+                "name": a.get("activityName"),
+                "distance_km": round(dist / 1000, 2) if dist else None,
+                "duration_min": num1((a.get("duration") or 0) / 60) or None,
+                "moving_min": num1(a["movingDuration"] / 60) if a.get("movingDuration") else None,
+                "pace_s_km": int(round(pace)) if pace else None,
+                "pace": _hms(pace),
+                "avg_hr": a.get("averageHR"),
+                "max_hr": a.get("maxHR"),
+                "avg_cadence": num1(a.get("averageRunningCadenceInStepsPerMinute")),
+                "avg_power": num1(a.get("avgPower")),
+                "elev_gain_m": num1(a.get("elevationGain")),
+                "aerobic_te": num1(a.get("aerobicTrainingEffect")),
+                "anaerobic_te": num1(a.get("anaerobicTrainingEffect")),
+                "te_label": a.get("trainingEffectLabel"),
+                "training_load": num1(a.get("activityTrainingLoad")),
+                "vo2max": a.get("vO2MaxValue"),
+                "kcal": num1(a.get("calories")),
+            })
+    return rows
+
+
+RECORD_COLUMNS = ["type_id", "record", "value", "display", "day", "activity_id", "activity_name"]
+RECORD_NAMES = {1: "1 км", 2: "1 миля", 3: "5 км", 4: "10 км", 5: "Полумарафон", 6: "Марафон",
+                7: "Самая длинная пробежка"}
+
+
+def _snapshot(con: sqlite3.Connection, key: str):
+    row = con.execute("SELECT payload FROM snapshots WHERE key=?", (key,)).fetchone()
+    try:
+        return json.loads(row[0]) if row and row[0] else None
+    except json.JSONDecodeError:
+        return None
+
+
+def build_records(con: sqlite3.Connection) -> list[dict]:
+    prs = _snapshot(con, "personal_records")
+    if isinstance(prs, dict):
+        prs = prs.get("personalRecords") or prs.get("records") or []
+    if not isinstance(prs, list):
+        return []
+    types = _snapshot(con, "personal_record_types") or []
+    type_keys = {t.get("id"): t.get("key") for t in types if isinstance(t, dict)} if isinstance(types, list) else {}
+    rows = []
+    for p in prs:
+        if not isinstance(p, dict) or p.get("value") is None:
+            continue
+        tid = p.get("typeId")
+        val = p["value"]
+        if tid in (1, 2, 3, 4, 5, 6):
+            display = _hms(val)
+        elif tid == 7:
+            display = f"{val / 1000:.2f} км".replace(".", ",")
+        else:
+            display = str(int(val)) if isinstance(val, (int, float)) and float(val).is_integer() else str(val)
+        day = (p.get("prStartTimeLocalFormatted") or p.get("actStartDateTimeInGMTFormatted")
+               or p.get("prStartTimeGmtFormatted") or "")[:10] or None
+        rows.append({
+            "type_id": tid,
+            "record": RECORD_NAMES.get(tid) or type_keys.get(tid) or f"Рекорд {tid}",
+            "value": val, "display": display, "day": day,
+            "activity_id": p.get("activityId"), "activity_name": p.get("activityName"),
+        })
+    rows.sort(key=lambda r: (r["type_id"] is None, r["type_id"] or 0))
+    return rows
+
+
+LT_COLUMNS = ["day", "lt_hr", "lt_speed_ms", "lt_pace_s_km", "lt_pace", "lt_power_w"]
+
+
+def _lt_speed(v):
+    """Garmin отдаёт скорость ПАНО в десятых долях: 0,36 означает 3,6 м/с."""
+    if not isinstance(v, (int, float)) or v <= 0:
+        return None
+    return round(v * 10 if v < 1.5 else v, 3)
+
+
+def build_lactate(con: sqlite3.Connection) -> list[dict]:
+    by_day: dict[str, dict] = {}
+
+    def put(day, field, value):
+        if day and value is not None:
+            by_day.setdefault(str(day)[:10], {})[field] = value
+
+    # История за год одним запросом: списки точек {дата, значение}
+    hist = _snapshot(con, "lactate_threshold_history") or {}
+    for field, src in (("lt_speed_ms", "speed"), ("lt_hr", "heart_rate"), ("lt_power_w", "power")):
+        items = hist.get(src) if isinstance(hist, dict) else None
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            day = it.get("calendarDate") or it.get("from") or it.get("date")
+            val = it.get("value")
+            if val is None:
+                val = it.get("functionalThresholdPower") if field == "lt_power_w" else None
+            put(day, field, _lt_speed(val) if field == "lt_speed_ms" else val)
+
+    # Ежедневные снимки «последнего» значения (копятся с каждым запуском)
+    for _, payload in con.execute("SELECT day, payload FROM raw_daily WHERE metric='lactate_threshold'"):
+        try:
+            lt = json.loads(payload) if payload else {}
+        except json.JSONDecodeError:
+            continue
+        sh = lt.get("speed_and_heart_rate") or {}
+        day = sh.get("calendarDate")
+        put(day, "lt_hr", sh.get("heartRate"))
+        put(day, "lt_speed_ms", _lt_speed(sh.get("speed")))
+        pw = lt.get("power") or {}
+        put(pw.get("calendarDate") or day, "lt_power_w", pw.get("functionalThresholdPower"))
+
+    rows = []
+    for day in sorted(by_day):
+        r = {c: None for c in LT_COLUMNS}
+        r.update(by_day[day])
+        r["day"] = day
+        sp = r.get("lt_speed_ms")
+        if sp:
+            r["lt_pace_s_km"] = int(round(1000 / sp))
+            r["lt_pace"] = _hms(1000 / sp)
+        rows.append(r)
+    return rows
+
+
+# Дополнительные таблицы: имя файла/таблицы SQLite, лист в Google-таблице, столбцы, построитель
+EXTRA_TABLES = [
+    ("activities", "Тренировки", ACTIVITY_COLUMNS, build_activities),
+    ("records", "Рекорды", RECORD_COLUMNS, build_records),
+    ("lactate_threshold", "Порог лактата", LT_COLUMNS, build_lactate),
+]
+
+
+def write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
+    def fmt(v):
+        if isinstance(v, float):
+            return str(v).replace(".", CSV_DECIMAL)
+        return "" if v is None else v
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=CSV_SEP)
+        w.writerow(columns)
+        for r in rows:
+            w.writerow([fmt(r.get(c)) for c in columns])
+
+
+def build_extras(con: sqlite3.Connection) -> list[dict]:
+    """Строит дополнительные таблицы, пишет их в SQLite и CSV. Ошибка в одной не мешает другим."""
+    extras = []
+    for name, tab, columns, builder in EXTRA_TABLES:
+        try:
+            rows = builder(con)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Таблица %s не собрана: %s: %s", name, type(exc).__name__, exc)
+            continue
+        con.execute(f"DROP TABLE IF EXISTS {name}")
+        con.execute(f"CREATE TABLE {name} ({', '.join(columns)})")
+        con.executemany(f"INSERT INTO {name} VALUES ({','.join('?' * len(columns))})",
+                        [[r.get(c) for c in columns] for r in rows])
+        path = DATA_DIR / f"{name}.csv"
+        write_csv(path, columns, rows)
+        extras.append({"name": name, "tab": tab, "columns": columns, "rows": rows, "csv": path})
+        log.info("Таблица «%s»: %d строк", tab, len(rows))
+    con.commit()
+    return extras
 
 
 # ---------------------------------------------------------------- export
@@ -358,7 +654,7 @@ def resolve_export_dir(setting: str) -> Path | None:
     return Path(setting).expanduser()
 
 
-def export_to_drive(con: sqlite3.Connection, setting: str) -> None:
+def export_to_drive(con: sqlite3.Connection, setting: str, extras: list[dict] | None = None) -> None:
     """Кладёт в папку Диска целостный снимок базы и CSV.
     Пишем во временный файл и подменяем — так Диск никогда не заливает недописанный файл."""
     dst = resolve_export_dir(setting)
@@ -375,9 +671,10 @@ def export_to_drive(con: sqlite3.Connection, setting: str) -> None:
         snap.close()
         os.replace(tmp_db, dst / "garmin.db")
 
-        tmp_csv = dst / "daily_summary.csv.tmp"
-        tmp_csv.write_bytes(CSV_PATH.read_bytes())
-        os.replace(tmp_csv, dst / "daily_summary.csv")
+        for src in [CSV_PATH] + [e["csv"] for e in extras or []]:
+            tmp_csv = dst / (src.name + ".tmp")
+            tmp_csv.write_bytes(src.read_bytes())
+            os.replace(tmp_csv, dst / src.name)
 
         log.info("Скопировано на Google Диск: %s", dst)
     except OSError as exc:
@@ -445,6 +742,28 @@ def _put_file(drive, state: dict, key: str, name: str, path: Path, mime: str, fo
         state[key] = f["id"]
 
 
+def _sheet_values(columns: list[str], rows: list[dict]) -> list[list]:
+    return [columns] + [["" if r.get(c) is None else r.get(c) for c in columns] for r in rows]
+
+
+def _update_tabs(sheets, sid: str, extras: list[dict]) -> None:
+    """Каждая дополнительная таблица — отдельный лист; недостающие листы создаются."""
+    if not extras:
+        return
+    meta = sheets.spreadsheets().get(spreadsheetId=sid, fields="sheets.properties.title").execute()
+    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    missing = [e["tab"] for e in extras if e["tab"] not in titles]
+    if missing:
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={
+            "requests": [{"addSheet": {"properties": {"title": t}}} for t in missing]}).execute()
+    for e in extras:
+        rng = f"'{e['tab']}'"
+        sheets.spreadsheets().values().clear(spreadsheetId=sid, range=f"{rng}!A:ZZ", body={}).execute()
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"{rng}!A1", valueInputOption="RAW",
+            body={"values": _sheet_values(e["columns"], e["rows"])}).execute()
+
+
 def _update_sheet(drive, sheets, state: dict, folder_id: str, rows: list[dict]) -> None:
     if not _alive(drive, state.get("sheet_id")):
         sp = sheets.spreadsheets().create(
@@ -461,7 +780,7 @@ def _update_sheet(drive, sheets, state: dict, folder_id: str, rows: list[dict]) 
         spreadsheetId=sid, range="A1", valueInputOption="RAW", body={"values": values}).execute()
 
 
-def upload_to_gdrive(con: sqlite3.Connection, rows: list[dict]) -> None:
+def upload_to_gdrive(con: sqlite3.Connection, rows: list[dict], extras: list[dict] | None = None) -> None:
     """Загрузка на Google Диск через API. Включается после однократного --drive-login."""
     if not GDRIVE_TOKEN.exists():
         return
@@ -492,7 +811,10 @@ def upload_to_gdrive(con: sqlite3.Connection, rows: list[dict]) -> None:
 
         _put_file(drive, state, "db_id", "garmin.db", snapshot, "application/x-sqlite3", folder_id)
         _put_file(drive, state, "csv_id", "daily_summary.csv", CSV_PATH, "text/csv", folder_id)
+        for e in extras or []:
+            _put_file(drive, state, f"csv_{e['name']}_id", e["csv"].name, e["csv"], "text/csv", folder_id)
         _update_sheet(drive, sheets, state, folder_id, rows)
+        _update_tabs(sheets, state["sheet_id"], extras or [])
 
         GDRIVE_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
         log.info("Загружено на Google Диск (папка %s, таблица «%s»)", GDRIVE_FOLDER, GDRIVE_SHEET_TITLE)
@@ -526,7 +848,7 @@ def main() -> int:
             log.error("Не удалось подключить Google Диск: %s: %s", type(exc).__name__, exc)
             return 4
         log.info("Google Диск подключён, токен сохранён в %s", GDRIVE_TOKEN)
-        upload_to_gdrive(con, build_summary(con))
+        upload_to_gdrive(con, build_summary(con), build_extras(con))
         return 0
 
     if not args.summary_only:
@@ -545,16 +867,18 @@ def main() -> int:
         log.info("Синхронизация %s … %s", start, end)
         try:
             sync(client, con, start, end, args.force)
+            sync_snapshots(client, con)
         except Exception:  # noqa: BLE001  (фатальная ошибка уже залогирована)
-            rows = build_summary(con)
-            export_to_drive(con, args.export_dir)
-            upload_to_gdrive(con, rows)
+            rows, extras = build_summary(con), build_extras(con)
+            export_to_drive(con, args.export_dir, extras)
+            upload_to_gdrive(con, rows, extras)
             return 3
 
     rows = build_summary(con)
+    extras = build_extras(con)
     log.info("Сводка: %d дней -> %s", len(rows), CSV_PATH)
-    export_to_drive(con, args.export_dir)
-    upload_to_gdrive(con, rows)
+    export_to_drive(con, args.export_dir, extras)
+    upload_to_gdrive(con, rows, extras)
     return 0
 
 
