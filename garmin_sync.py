@@ -586,6 +586,65 @@ def build_lactate(con: sqlite3.Connection) -> list[dict]:
     return rows
 
 
+SLEEP_STAGE_COLUMNS = ["day", "seq", "start_local", "minutes", "stage"]
+SLEEP_STAGE_NIGHTS = 120          # сколько последних ночей выгружать на лист «Фазы сна»
+# Garmin: activityLevel в sleepLevels — 0 глубокий, 1 лёгкий, 2 REM, 3 бодрствование
+SLEEP_STAGE_NAMES = {0: "deep", 1: "light", 2: "rem", 3: "awake"}
+
+
+def _parse_ts(v):
+    """Время из Garmin: миллисекунды эпохи или строка ISO 'YYYY-MM-DDTHH:MM:SS.0'."""
+    if isinstance(v, (int, float)):
+        return dt.datetime.fromtimestamp(v / 1000, tz=dt.timezone.utc).replace(tzinfo=None)
+    if isinstance(v, str):
+        try:
+            return dt.datetime.fromisoformat(v.replace("Z", "").split(".")[0])
+        except ValueError:
+            return None
+    return None
+
+
+def build_sleep_stages(con: sqlite3.Connection) -> list[dict]:
+    """Последовательность фаз сна за ночь: по порядку, с длительностью каждого отрезка."""
+    rows_db = con.execute(
+        "SELECT day, payload FROM raw_daily WHERE metric='sleep' ORDER BY day DESC LIMIT ?",
+        (SLEEP_STAGE_NIGHTS,)).fetchall()
+    out = []
+    for day, payload in reversed(rows_db):
+        try:
+            sleep = json.loads(payload) if payload else None
+        except json.JSONDecodeError:
+            continue
+        levels = find_key(sleep, "sleepLevels")
+        if not isinstance(levels, list) or not levels:
+            continue
+        # сдвиг местного времени относительно GMT — из начала сна
+        dto = (sleep or {}).get("dailySleepDTO") or {}
+        g, l = dto.get("sleepStartTimestampGMT"), dto.get("sleepStartTimestampLocal")
+        offset = dt.timedelta(milliseconds=(l - g)) if isinstance(g, (int, float)) and isinstance(l, (int, float)) else dt.timedelta(0)
+        segs = []
+        for it in levels:
+            if not isinstance(it, dict):
+                continue
+            s, e = _parse_ts(it.get("startGMT")), _parse_ts(it.get("endGMT"))
+            lvl = it.get("activityLevel")
+            if s is None or e is None or lvl is None or e <= s:
+                continue
+            segs.append((s, e, SLEEP_STAGE_NAMES.get(int(round(lvl)), str(lvl))))
+        segs.sort()
+        # склеиваем соседние отрезки одной фазы
+        merged = []
+        for s, e, st in segs:
+            if merged and merged[-1][2] == st and merged[-1][1] >= s:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e), st)
+            else:
+                merged.append((s, e, st))
+        for i, (s, e, st) in enumerate(merged):
+            out.append({"day": day, "seq": i + 1, "start_local": (s + offset).strftime("%H:%M"),
+                        "minutes": round((e - s).total_seconds() / 60), "stage": st})
+    return out
+
+
 PROFILE_COLUMNS = ["age", "sex", "height_cm", "weight_kg", "updated"]
 
 
@@ -620,6 +679,7 @@ EXTRA_TABLES = [
     ("records", "Рекорды", RECORD_COLUMNS, build_records),
     ("lactate_threshold", "Порог лактата", LT_COLUMNS, build_lactate),
     ("profile", "Профиль", PROFILE_COLUMNS, build_profile),
+    ("sleep_stages", "Фазы сна", SLEEP_STAGE_COLUMNS, build_sleep_stages),
 ]
 
 
