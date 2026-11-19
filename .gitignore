@@ -1,0 +1,12 @@
+# Секреты — никогда не коммитить
+credentials.json
+client_secret*.json
+*token*.json
+
+# Локальные данные и окружение
+data/
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.tmp

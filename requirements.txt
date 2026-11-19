@@ -1,0 +1,5 @@
+garminconnect>=0.3.0
+curl_cffi
+ua-generator
+google-api-python-client
+google-auth-oauthlib
