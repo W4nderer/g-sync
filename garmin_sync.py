@@ -79,6 +79,11 @@ SNAPSHOT_METRICS = {
         end_date=dt.date.today().isoformat()),
 }
 
+# Пульсовые зоны для разбивки пробежек (как на дашборде): лёгкая — до EASY, пороговая — от THRESHOLD.
+EASY_HR_MAX = int(os.environ.get("GARMIN_EASY_HR_MAX", 152))
+THRESHOLD_HR_MIN = int(os.environ.get("GARMIN_THRESHOLD_HR_MIN", 170))
+SERIES_MAX_PER_RUN = 400   # сколько пробежек догружать за запуск (первый раз — вся история понемногу)
+
 # Ошибки, при которых нет смысла продолжать (имена классов garminconnect)
 FATAL_ERRORS = ("Authentication", "TooManyRequests")
 
@@ -115,6 +120,12 @@ def open_db() -> sqlite3.Connection:
             key        TEXT PRIMARY KEY,
             payload    TEXT,
             fetched_at TEXT NOT NULL
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS activity_series (
+            activity_id INTEGER PRIMARY KEY,
+            payload     TEXT,
+            fetched_at  TEXT NOT NULL
         )""")
     return con
 
@@ -228,6 +239,106 @@ def sync_snapshots(client, con: sqlite3.Connection) -> None:
         time.sleep(REQUEST_DELAY)
     con.commit()
     log.info("Профиль, рекорды и порог лактата обновлены")
+
+
+def _series_from_details(details) -> dict | None:
+    """Из get_activity_details оставляем только время (с), пульс и скорость (м/с) — компактно."""
+    if not isinstance(details, dict):
+        return None
+    idx = {d.get("key"): d.get("metricsIndex") for d in details.get("metricDescriptors") or [] if isinstance(d, dict)}
+    i_hr, i_v = idx.get("directHeartRate"), idx.get("directSpeed")
+    i_t, scale = idx.get("sumDuration"), 1.0
+    if i_t is None and idx.get("directTimestamp") is not None:
+        i_t, scale = idx["directTimestamp"], 0.001
+    if i_hr is None or i_t is None:
+        return None
+    t, hr, v = [], [], []
+    for row in details.get("activityDetailMetrics") or []:
+        m = row.get("metrics") if isinstance(row, dict) else None
+        if not isinstance(m, list):
+            continue
+        tt = m[i_t] if i_t < len(m) else None
+        hh = m[i_hr] if i_hr < len(m) else None
+        vv = m[i_v] if i_v is not None and i_v < len(m) else None
+        if tt is None:
+            continue
+        t.append(round(tt * scale, 1))
+        hr.append(int(round(hh)) if isinstance(hh, (int, float)) else None)
+        v.append(round(vv, 2) if isinstance(vv, (int, float)) else None)
+    if len(t) < 10:
+        return None
+    t0 = t[0]
+    return {"t": [round(x - t0, 1) for x in t], "hr": hr, "v": v}
+
+
+def _is_run(typ: str) -> bool:
+    return any(k in (typ or "") for k in ("running", "treadmill", "trail", "track"))
+
+
+def sync_activity_series(client, con: sqlite3.Connection) -> None:
+    """Пульс и скорость по ходу пробежки — для минут в зонах и дрейфа пульса. Каждая пробежка загружается один раз."""
+    have = {r[0] for r in con.execute("SELECT activity_id FROM activity_series")}
+    todo = [a for a in build_activities(con) if _is_run(a["type"]) and a["activity_id"] and a["activity_id"] not in have]
+    todo.sort(key=lambda a: a["day"], reverse=True)   # сначала свежие
+    done = 0
+    for a in todo[:SERIES_MAX_PER_RUN]:
+        aid = a["activity_id"]
+        try:
+            details = client.get_activity_details(aid, maxchart=2000, maxpoly=0)
+        except AttributeError:
+            log.warning("get_activity_details нет в этой версии garminconnect — пропускаю пульс по ходу пробежек")
+            return
+        except Exception as exc:  # noqa: BLE001
+            if is_fatal(exc):
+                log.error("Остановка: %s: %s", type(exc).__name__, exc)
+                con.commit()
+                raise
+            log.warning("Пробежка %s (%s): %s: %s", aid, a["day"], type(exc).__name__, exc)
+            time.sleep(REQUEST_DELAY)
+            continue
+        series = _series_from_details(details)
+        con.execute("INSERT OR REPLACE INTO activity_series(activity_id, payload, fetched_at) VALUES (?,?,?)",
+                    (aid, json.dumps(series) if series else None, dt.datetime.now().isoformat(timespec="seconds")))
+        done += 1
+        if done % 20 == 0:
+            con.commit()
+            log.info("Пульс по ходу пробежек: %d из %d", done, len(todo))
+        time.sleep(REQUEST_DELAY)
+    con.commit()
+    if todo:
+        log.info("Пульс по ходу пробежек: загружено %d, осталось %d", done, max(0, len(todo) - done))
+
+
+def hr_zone_minutes(series: dict) -> tuple:
+    """Минуты в зонах: лёгкая (≤ EASY_HR_MAX), серая, пороговая (≥ THRESHOLD_HR_MIN). Паузы > 10 с не считаются."""
+    t, hr = series.get("t") or [], series.get("hr") or []
+    z = [0.0, 0.0, 0.0]
+    for i in range(len(t) - 1):
+        h = hr[i]
+        d = t[i + 1] - t[i]
+        if h is None or d <= 0 or d > 10:
+            continue
+        z[0 if h <= EASY_HR_MAX else 2 if h >= THRESHOLD_HR_MIN else 1] += d
+    if sum(z) < 60:
+        return None, None, None
+    return tuple(round(x / 60, 1) for x in z)
+
+
+def hr_drift(series: dict):
+    """Дрейф пульса (Pa:HR): насколько упала эффективность (скорость/пульс) во второй половине. Без первых 10 мин разминки.
+    Считается для пробежек от 40 минут движения; < 5% — хорошая аэробная база."""
+    t, hr, v = series.get("t") or [], series.get("hr") or [], series.get("v") or []
+    pts = [(t[i], hr[i], v[i]) for i in range(len(t))
+           if hr[i] and v[i] is not None and v[i] > 1.0 and t[i] >= 600]
+    if len(pts) < 20 or pts[-1][0] - pts[0][0] < 30 * 60:
+        return None
+    mid = (pts[0][0] + pts[-1][0]) / 2
+    def ef(part):
+        return (sum(p[2] for p in part) / len(part)) / (sum(p[1] for p in part) / len(part))
+    a, b = [p for p in pts if p[0] < mid], [p for p in pts if p[0] >= mid]
+    if len(a) < 10 or len(b) < 10:
+        return None
+    return round((ef(a) / ef(b) - 1) * 100, 1)
 
 
 # ---------------------------------------------------------------- summary
@@ -426,12 +537,18 @@ ACTIVITY_COLUMNS = [
     "distance_km", "duration_min", "moving_min", "pace_s_km", "pace",
     "avg_hr", "max_hr", "avg_cadence", "avg_power", "elev_gain_m",
     "aerobic_te", "anaerobic_te", "te_label", "training_load", "vo2max", "kcal",
+    "hr_easy_min", "hr_grey_min", "hr_hard_min", "hr_drift_pct",
 ]
 
 
 def build_activities(con: sqlite3.Connection) -> list[dict]:
     """Одна строка на тренировку — из уже загруженных списков тренировок по дням."""
     rows, seen = [], set()
+    series = {}
+    try:
+        series = {aid: p for aid, p in con.execute("SELECT activity_id, payload FROM activity_series") if p}
+    except sqlite3.OperationalError:
+        pass
     for day, payload in con.execute("SELECT day, payload FROM raw_daily WHERE metric='activities' ORDER BY day"):
         try:
             acts = json.loads(payload) if payload else []
@@ -472,6 +589,14 @@ def build_activities(con: sqlite3.Connection) -> list[dict]:
                 "vo2max": a.get("vO2MaxValue"),
                 "kcal": num1(a.get("calories")),
             })
+            zones, drift = (None, None, None), None
+            if aid in series:
+                try:
+                    s = json.loads(series[aid])
+                    zones, drift = hr_zone_minutes(s), hr_drift(s)
+                except (json.JSONDecodeError, TypeError, IndexError):
+                    pass
+            rows[-1].update({"hr_easy_min": zones[0], "hr_grey_min": zones[1], "hr_hard_min": zones[2], "hr_drift_pct": drift})
     return rows
 
 
@@ -968,6 +1093,7 @@ def main() -> int:
         try:
             sync(client, con, start, end, args.force)
             sync_snapshots(client, con)
+            sync_activity_series(client, con)
         except Exception:  # noqa: BLE001  (фатальная ошибка уже залогирована)
             rows, extras = build_summary(con), build_extras(con)
             export_to_drive(con, args.export_dir, extras)
