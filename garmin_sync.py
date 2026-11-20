@@ -82,7 +82,8 @@ SNAPSHOT_METRICS = {
 # Пульсовые зоны для разбивки пробежек (как на дашборде): лёгкая — до EASY, пороговая — от THRESHOLD.
 EASY_HR_MAX = int(os.environ.get("GARMIN_EASY_HR_MAX", 152))
 THRESHOLD_HR_MIN = int(os.environ.get("GARMIN_THRESHOLD_HR_MIN", 170))
-SERIES_MAX_PER_RUN = 400   # сколько пробежек догружать за запуск (первый раз — вся история понемногу)
+SERIES_MAX_PER_RUN = 400
+DRIFT_MAX_PACE_CHANGE = 0.05  # дрейф пульса — только для пробежек, где темп половин отличается не больше чем на 5%   # сколько пробежек догружать за запуск (первый раз — вся история понемногу)
 
 # Ошибки, при которых нет смысла продолжать (имена классов garminconnect)
 FATAL_ERRORS = ("Authentication", "TooManyRequests")
@@ -326,7 +327,7 @@ def hr_zone_minutes(series: dict) -> tuple:
 
 def hr_drift(series: dict):
     """Дрейф пульса (Pa:HR): насколько упала эффективность (скорость/пульс) во второй половине. Без первых 10 мин разминки.
-    Считается для пробежек от 40 минут движения; < 5% — хорошая аэробная база."""
+    Считается для пробежек от 40 минут движения в ровном темпе; < 5% — хорошая аэробная база."""
     t, hr, v = series.get("t") or [], series.get("hr") or [], series.get("v") or []
     pts = [(t[i], hr[i], v[i]) for i in range(len(t))
            if hr[i] and v[i] is not None and v[i] > 1.0 and t[i] >= 600]
@@ -337,6 +338,10 @@ def hr_drift(series: dict):
         return (sum(p[2] for p in part) / len(part)) / (sum(p[1] for p in part) / len(part))
     a, b = [p for p in pts if p[0] < mid], [p for p in pts if p[0] >= mid]
     if len(a) < 10 or len(b) < 10:
+        return None
+    # дрейф имеет смысл только при ровном темпе: если половины отличаются по скорости больше чем на 5%, не считаем
+    va, vb = sum(p[2] for p in a) / len(a), sum(p[2] for p in b) / len(b)
+    if abs(vb / va - 1) > DRIFT_MAX_PACE_CHANGE:
         return None
     return round((ef(a) / ef(b) - 1) * 100, 1)
 
